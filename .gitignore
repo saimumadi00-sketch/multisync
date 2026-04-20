@@ -1,0 +1,11 @@
+# Binaries and objects
+*.o
+multisync
+*.rle
+*.out
+
+# Test data
+tests/data/
+
+# macOS
+.DS_Store
