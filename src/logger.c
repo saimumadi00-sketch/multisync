@@ -14,23 +14,23 @@ void logger_destroy(void) {
     pthread_mutex_destroy(&log_mutex);
 }
 
-void logger_log(int job_id, const char *fmt, ...) {
-    /* Get timestamp */
+void logger_log(int job_id, const char *fmt, ...)
+{
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    long ms = ts.tv_nsec / 1000000;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    /* Show elapsed ms since program epoch (mod 100000 keeps it short) */
+    long ms = (ts.tv_sec * 1000L) + (ts.tv_nsec / 1000000L);
 
+    /* Build the message into a local buffer first so we hold the
+     * mutex for the shortest possible time (just the write+flush). */
+    char msg[1024];
     va_list args;
     va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);   /* done with va_list — release before taking mutex */
 
     pthread_mutex_lock(&log_mutex);
-
-    printf("[job-%02d | %ld ms] ", job_id, ms % 100000);
-    vprintf(fmt, args);
-    printf("\n");
+    printf("[job-%02d | %ldms] %s\n", job_id, ms % 100000L, msg);
     fflush(stdout);
-
     pthread_mutex_unlock(&log_mutex);
-
-    va_end(args);
 }

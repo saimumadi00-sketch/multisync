@@ -1,32 +1,64 @@
 #include "rle.h"
-#include <stdio.h>
+#include <string.h>
 
-/*
- * RLE format (compress):
- *   For each run of identical bytes:
- *     byte 1: count (1-255)
- *     byte 2: the repeated byte value
- *
- * Example: AAABBC -> 03 41 02 42 01 43
- */
+/* ── Header helpers ─────────────────────────────────────────────────── */
+
+static void write_header(unsigned char *dst, uint64_t original_size)
+{
+    /* Magic */
+    dst[0] = RLE_MAGIC_0;
+    dst[1] = RLE_MAGIC_1;
+    dst[2] = RLE_MAGIC_2;
+    dst[3] = RLE_MAGIC_3;
+    /* original_size: little-endian uint64 */
+    for (int i = 0; i < 8; i++)
+        dst[4 + i] = (unsigned char)((original_size >> (8 * i)) & 0xFF);
+}
+
+static int check_magic(const unsigned char *src)
+{
+    return src[0] == RLE_MAGIC_0 &&
+           src[1] == RLE_MAGIC_1 &&
+           src[2] == RLE_MAGIC_2 &&
+           src[3] == RLE_MAGIC_3;
+}
+
+static uint64_t read_uint64_le(const unsigned char *p)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++)
+        v |= ((uint64_t)p[i]) << (8 * i);
+    return v;
+}
+
+/* ── Public API ─────────────────────────────────────────────────────── */
+
+size_t rle_original_size(const unsigned char *src, size_t len)
+{
+    if (!src || len < RLE_HEADER_LEN) return 0;
+    if (!check_magic(src))            return 0;
+    return (size_t)read_uint64_le(src + 4);
+}
 
 long rle_compress(const unsigned char *src, size_t len,
-                  unsigned char *dst, size_t dst_len)
+                  unsigned char *dst,  size_t dst_len)
 {
-    if (!src || !dst || len == 0) return -1;
+    if (!src || !dst || len == 0)              return -1;
+    if (dst_len < RLE_HEADER_LEN + 2 * len)   return -1;
 
-    size_t i = 0, out = 0;
+    write_header(dst, (uint64_t)len);
+
+    size_t i = 0;
+    size_t out = RLE_HEADER_LEN;   /* payload starts after header */
 
     while (i < len) {
         unsigned char val   = src[i];
         unsigned char count = 1;
 
-        /* Count consecutive identical bytes (max 255 per run) */
         while (i + count < len && src[i + count] == val && count < 255)
             count++;
 
-        if (out + 2 > dst_len) return -1; /* output buffer too small */
-
+        if (out + 2 > dst_len) return -1;
         dst[out++] = count;
         dst[out++] = val;
         i += count;
@@ -36,22 +68,32 @@ long rle_compress(const unsigned char *src, size_t len,
 }
 
 long rle_decompress(const unsigned char *src, size_t len,
-                    unsigned char *dst, size_t dst_len)
+                    unsigned char *dst,  size_t dst_len)
 {
-    if (!src || !dst || len == 0) return -1;
-    if (len % 2 != 0) return -1; /* must be pairs */
+    if (!src || !dst || len < RLE_HEADER_LEN) return -1;
+    if (!check_magic(src))                    return -1;
 
+    uint64_t expected = read_uint64_le(src + 4);
+    if (dst_len < (size_t)expected)           return -1;
+
+    /* Payload starts after the header */
+    size_t pay_len = len - RLE_HEADER_LEN;
+    if (pay_len % 2 != 0) return -1;  /* must be (count, value) pairs */
+
+    const unsigned char *pay = src + RLE_HEADER_LEN;
     size_t i = 0, out = 0;
 
-    while (i < len) {
-        unsigned char count = src[i++];
-        unsigned char val   = src[i++];
+    while (i < pay_len) {
+        unsigned char count = pay[i++];
+        unsigned char val   = pay[i++];
 
         if (out + count > dst_len) return -1;
-
-        for (unsigned char k = 0; k < count; k++)
-            dst[out++] = val;
+        memset(dst + out, val, count);
+        out += count;
     }
+
+    /* Sanity: decoded size must match what the header promised */
+    if (out != (size_t)expected) return -1;
 
     return (long)out;
 }

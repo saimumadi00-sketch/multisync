@@ -59,57 +59,82 @@ void *worker_run(void *arg)
     }
     logger_log(job->job_id, "Read %ld bytes from '%s'", in_size, job->input_path);
 
-    /* ── Allocate output buffer ── */
-    size_t out_max = (job->mode == MODE_COMPRESS)
-                     ? (size_t)in_size * 2   /* RLE worst case */
-                     : (size_t)in_size * 128; /* decompress upper bound */
+    {   /* new scope so we can declare vars after the goto-safe label */
 
-    unsigned char *out_buf = malloc(out_max);
-    if (!out_buf) {
-        logger_log(job->job_id, "ERROR: malloc failed");
+        /* ── Allocate output buffer ── */
+        size_t out_max;
+        if (job->mode == MODE_COMPRESS) {
+            /* RLE worst case: every byte unique → 2 bytes each, plus header */
+            out_max = RLE_HEADER_LEN + (size_t)in_size * 2;
+        } else {
+            /* Read exact original size from the .rle header — no guessing */
+            size_t orig = rle_original_size(in_buf, (size_t)in_size);
+            if (orig == 0) {
+                logger_log(job->job_id,
+                           "ERROR: '%s' is not a valid .rle file (bad header)",
+                           job->input_path);
+                free(in_buf);
+                goto done;
+            }
+            out_max = orig;
+        }
+
+        unsigned char *out_buf = malloc(out_max);
+        if (!out_buf) {
+            logger_log(job->job_id, "ERROR: malloc failed (%zu bytes)", out_max);
+            free(in_buf);
+            goto done;
+        }
+
+        /* ── Compress or decompress ── */
+        long out_size;
+        if (job->mode == MODE_COMPRESS)
+            out_size = rle_compress(in_buf, (size_t)in_size, out_buf, out_max);
+        else
+            out_size = rle_decompress(in_buf, (size_t)in_size, out_buf, out_max);
+
+        /* Save in_size before freeing — used in log below */
+        long saved_in_size = in_size;
         free(in_buf);
-        goto done;
-    }
+        in_buf = NULL;
 
-    /* ── Compress or Decompress ── */
-    long out_size;
-    if (job->mode == MODE_COMPRESS) {
-        out_size = rle_compress(in_buf, (size_t)in_size, out_buf, out_max);
-    } else {
-        out_size = rle_decompress(in_buf, (size_t)in_size, out_buf, out_max);
-    }
+        if (out_size < 0) {
+            logger_log(job->job_id, "ERROR: %s failed on '%s'",
+                       job->mode == MODE_COMPRESS ? "compression" : "decompression",
+                       job->input_path);
+            free(out_buf);
+            goto done;
+        }
 
-    free(in_buf);
-
-    if (out_size < 0) {
-        logger_log(job->job_id, "ERROR: %s failed on '%s'",
-                   job->mode == MODE_COMPRESS ? "compression" : "decompression",
-                   job->input_path);
+        /* ── Write output ── */
+        if (write_file(job->output_path, out_buf, (size_t)out_size) < 0) {
+            logger_log(job->job_id, "ERROR: cannot write '%s'", job->output_path);
+            free(out_buf);
+            goto done;
+        }
         free(out_buf);
-        goto done;
+
+        /* ── Log result ── */
+        if (job->mode == MODE_COMPRESS) {
+            double ratio = 100.0 * (1.0 - (double)out_size / (double)saved_in_size);
+            if (ratio >= 0)
+                logger_log(job->job_id,
+                           "Compressed '%s' -> '%s' (%.1f%% smaller, %ld -> %ld bytes)",
+                           job->input_path, job->output_path,
+                           ratio, saved_in_size, out_size);
+            else
+                logger_log(job->job_id,
+                           "Compressed '%s' -> '%s' (%.1f%% larger, %ld -> %ld bytes)",
+                           job->input_path, job->output_path,
+                           -ratio, saved_in_size, out_size);
+        } else {
+            logger_log(job->job_id,
+                       "Decompressed '%s' -> '%s' (%ld bytes restored)",
+                       job->input_path, job->output_path, out_size);
+        }
+
+        job->result = 0;
     }
-
-    /* ── Write output ── */
-    if (write_file(job->output_path, out_buf, (size_t)out_size) < 0) {
-        logger_log(job->job_id, "ERROR: cannot write '%s'", job->output_path);
-        free(out_buf);
-        goto done;
-    }
-    free(out_buf);
-
-    /* ── Log result ── */
-    double ratio = (job->mode == MODE_COMPRESS)
-                   ? (100.0 * (1.0 - (double)out_size / (double)in_size))
-                   : 0.0;
-
-    if (job->mode == MODE_COMPRESS)
-        logger_log(job->job_id, "Compressed '%s' -> '%s' (%.1f%% smaller, %ld -> %ld bytes)",
-                   job->input_path, job->output_path, ratio, in_size, out_size);
-    else
-        logger_log(job->job_id, "Decompressed '%s' -> '%s' (%ld bytes)",
-                   job->input_path, job->output_path, out_size);
-
-    job->result = 0;
 
 done:
     clock_gettime(CLOCK_MONOTONIC, &t_end);
