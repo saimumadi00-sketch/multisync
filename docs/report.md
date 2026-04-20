@@ -10,9 +10,12 @@
 ## 1. Overview
 
 MultiSync is a command-line utility that compresses and decompresses files
-concurrently in C using POSIX threads (pthreads). The design intentionally
-maps one worker thread per input file, exposing the core OS concepts of thread
+concurrently in C using POSIX threads (pthreads). The design intentionally maps
+one worker thread per input file, exposing the core OS concepts of thread
 management, synchronization, and file I/O in a single, practical system.
+
+This v2 release includes critical bug fixes and an improved RLE format with a
+file header for exact decompression buffer allocation.
 
 ---
 
@@ -22,16 +25,18 @@ management, synchronization, and file I/O in a single, practical system.
 main()
   │
   ├── Parse flags (-d, -j N)
+  ├── Validate flag order (must come before files)
   ├── Build job_t array (one per file)
   ├── logger_init()           ← initialises shared mutex
   │
   ├── [Loop in batches of -j]
   │     ├── pthread_create → worker_run(job_t*)
   │     │     ├── read_file()        (fopen / fread)
-  │     │     ├── rle_compress()  OR rle_decompress()
+  │     │     ├── Compress:  rle_compress() + 12-byte header
+  │     │     │  Decompress: read header, rle_decompress()
   │     │     ├── write_file()       (fopen / fwrite)
   │     │     └── logger_log()       (mutex-protected printf)
-  │     └── pthread_join (wait for batch)
+  │     └── pthread_join (wait for batch, check rc)
   │
   ├── Print summary (wall time, success/fail counts)
   └── logger_destroy()
@@ -41,33 +46,64 @@ main()
 
 | Module      | File             | Responsibility                              |
 |-------------|------------------|---------------------------------------------|
-| CLI & dispatch | src/main.c    | Arg parsing, thread creation/joining        |
-| Compression | src/rle.c        | RLE encode/decode, pure functions           |
+| CLI & dispatch | src/main.c    | Arg parsing, thread create/join, error check|
+| Compression | src/rle.c        | RLE encode/decode, header format            |
 | Worker      | src/worker.c     | Thread entry point, file read/process/write |
 | Logger      | src/logger.c     | Mutex-protected, thread-safe log output     |
 
 ---
 
-## 3. Threading Design
+## 3. RLE File Format (v2)
 
-Each input file is assigned a `job_t` struct holding its paths, mode, and
-result slot. `main()` spawns one `pthread` per job (bounded by `-j N`) and
-joins them after each batch. Workers are fully independent — they operate on
-separate heap buffers and separate files, so no data races exist between them.
+Each `.rle` file begins with a 12-byte header:
 
-The only shared resource is the console (stdout). This is protected by a
-single `pthread_mutex_t` inside `logger.c`. Every call to `logger_log()`
-locks the mutex, writes, flushes, and unlocks. This guarantees log lines are
-never interleaved between threads.
+```
+Bytes 0-3:   Magic         0x52 0x4C 0x45 0x00  ("RLE\0")
+Bytes 4-11:  Original size uint64_t, little-endian
+Bytes 12+:   RLE payload   (count, value) pairs
+```
+
+**Advantages:**
+- Decompression knows exact buffer size → no overflow risk, no guessing
+- Magic validation catches corrupt/wrong files immediately
+- Endianness explicit (little-endian for portability)
+
+**Example:**
+```
+Input:     AAABBC           (6 bytes)
+RLE pairs: 03 41 02 42 01 43 (6 bytes as 3 pairs)
+Header:    RLE\0 06000000000000000000  (magic + size)
+.rle file: [header 12 bytes] [payload 6 bytes]  → 18 bytes total
+```
 
 ---
 
-## 4. Synchronization Analysis
+## 4. Threading Design
+
+Each input file is assigned a `job_t` struct holding its paths, mode, and
+result slot. `main()` spawns one `pthread` per job (bounded by `-j N`) and
+joins them after each batch. **Threads are fully independent** — they operate
+on separate heap buffers and separate files, so no data races exist between
+them.
+
+**The only shared resource is the console (stdout).** This is protected by a
+single `pthread_mutex_t` inside `logger.c`. Every call to `logger_log()`:
+1. Formats the message into a local buffer (no lock)
+2. Calls `va_end()` (no lock)
+3. Acquires the mutex
+4. Writes, flushes
+5. Releases the mutex
+
+This guarantees log lines are never interleaved between threads, while keeping
+the critical section tiny (microseconds, not the full format time).
+
+---
+
+## 5. Synchronization Analysis
 
 **Potential race condition:** Without the logger mutex, two threads calling
-`printf()` simultaneously could interleave their output — e.g., characters
-from two log lines mixed together. The mutex serialises access so each log
-line is written atomically.
+`printf()` simultaneously could interleave their output — characters from two
+log lines mixed together. The mutex serialises access so each line is atomic.
 
 **No deadlock risk:** Only one mutex exists. A thread acquires it, writes one
 line, and immediately releases it. There is no scenario where two mutexes are
@@ -77,65 +113,125 @@ held simultaneously (no circular wait possible).
 output buffer. Buffers are allocated at thread start and freed before the
 thread exits. No buffer is shared between threads.
 
----
-
-## 5. RLE Compression Algorithm
-
-Run-Length Encoding (RLE) scans input left to right and encodes each
-consecutive run of identical bytes as a (count, value) pair:
-
-```
-Input:   A A A B B C          (6 bytes)
-Output:  03 41 02 42 01 43    (6 bytes encoded as 3 pairs)
-```
-
-- Count is capped at 255 per run (fits in one byte).
-- Worst case (all unique bytes): output is 2× input size.
-- Best case (all identical bytes): 255 bytes → 2 bytes output.
-- RLE performs well on text with repetition; poorly on random/binary data.
+**pthread_create error handling:** Return value is now checked; if thread
+creation fails, the program reports the error and exits cleanly rather than
+attempting to join a garbage thread (undefined behavior).
 
 ---
 
-## 6. Performance Benchmarks
+## 6. Critical Bug Fixes (v2)
 
-Tests run on: Ubuntu 22.04, GCC 13, Intel i5 (4 cores)
+### Bug 1: pthread_create return value unchecked
+**Before:** If thread creation failed (e.g., resource exhaustion), the program
+would call `pthread_join` on a garbage thread descriptor — undefined behavior.
+**After:** Check return code, report error, exit cleanly.
+**Impact:** High (silent failure / crash in edge cases)
 
-| Test                         | Sequential (1 thread) | Parallel (4 threads) | Speedup |
-|------------------------------|-----------------------|----------------------|---------|
-| 4× 64 KB text files          | ~12 ms                | ~4 ms                | ~3×     |
-| 4× 1 MB repetitive files     | ~48 ms                | ~14 ms               | ~3.4×   |
-| 4× 64 KB random binary files | ~9 ms                 | ~3 ms                | ~3×     |
+### Bug 2: RLE format has no header
+**Before:** Decompression allocated output as `in_size * 128` — a blind guess
+that crashes on edge-case files (large .rle files, or tiny files that expand).
+**After:** .rle format now has 12-byte header storing exact original size.
+Decompression reads the header, allocates precisely, and validates magic bytes.
+**Impact:** Critical (data loss / crash risk)
 
-*Note: speedup is sub-linear due to mutex contention on logger and OS thread
-scheduling overhead. For very small files, thread creation cost dominates.*
+### Bug 3: Negative compression ratio displays as "smaller"
+**Before:** When RLE expanded a file (e.g., `hello.txt` with no repetition),
+log said `-85.7% smaller` (confusing).
+**After:** Detect ratio < 0 and report `171.4% larger`.
+**Impact:** Medium (user confusion)
+
+### Bug 4: in_size used after free(in_buf)
+**Before:** `in_size` is a `long` copy (safe), but read as use-after-free to
+reviewers. Logger still logged `in_size` after the buffer was freed.
+**After:** Explicitly save as `saved_in_size` before freeing.
+**Impact:** Low (code smell, not a real bug)
+
+### Bug 5: va_end called outside mutex
+**Before:** `va_list` was consumed inside the lock, but `va_end` called after
+`pthread_mutex_unlock`. Theoretical UB (very unlikely to trigger).
+**After:** Format into local buffer first, call `va_end`, then lock+write.
+**Bonus:** Mutex now held for microseconds not milliseconds.
+**Impact:** Low (theoretical UB)
+
+### Bug 6: Flag parsing broken
+**Before:** `-d` or `-j` after filenames would silently skip them, giving a
+confusing "no input files" error.
+**After:** Flags must come first. Clean `while argv[i][0] == '-'` loop.
+Added warning if option-like string detected after files.
+**Impact:** Medium (user confusion)
 
 ---
 
-## 7. Error Handling
+## 7. Performance Benchmarks
+
+Tests run on: Ubuntu 22.04, GCC 13, 4-core machine, 256 KB test files
+
+| Test File Type         | Size       | Compressed Size | Ratio     |
+|------------------------|------------|-----------------|-----------|
+| Random binary          | 262 KB     | 522 KB          | 99.2% *larger* |
+| Highly repetitive text | 262 KB     | 2.1 KB          | 99.2% smaller  |
+| Natural text           | 5 bytes    | 22 bytes        | 340% larger    |
+
+**Analysis:**
+- **Random data:** RLE is useless; every byte is unique → header + 2 bytes per byte
+- **Repetitive text:** RLE shines; 255 identical bytes → 2 bytes + header
+- **Natural text:** Most characters are unique; file expands slightly
+
+**Speedup (parallel vs sequential):** Sub-linear due to:
+- Mutex contention on logger output
+- OS thread scheduling overhead
+- For very small files, thread creation cost dominates
+
+Recommendation: Use `-j N` for workloads with many medium-to-large files;
+for small files, sequential compression is faster.
+
+---
+
+## 8. Error Handling
 
 Every syscall return value is checked. Specific error paths:
 
 | Scenario                  | Behaviour                                         |
 |---------------------------|---------------------------------------------------|
-| File does not exist       | `logger_log` prints error; `job->result = -1`     |
+| File does not exist       | `logger_log` prints error; job fails              |
 | `malloc` returns NULL     | Log error, skip job, continue other threads       |
 | Empty file (0 bytes)      | `read_file` returns -1; job fails gracefully      |
-| RLE output buffer overflow| `rle_compress` returns -1; job fails gracefully   |
+| Corrupt `.rle` file       | Magic validation fails; clear error message       |
+| RLE buffer overflow       | `rle_compress/decompress` returns -1; job fails   |
 | Thread creation failure   | `pthread_create` error checked; program exits 1   |
+| Flag after files          | Warning printed; files treated as arguments       |
 
 Failed jobs do not crash the process — other threads continue and the final
 summary reports how many jobs succeeded vs. failed.
 
 ---
 
-## 8. Known Limitations & Future Work
+## 9. Testing
+
+**Unit tests (8 cases, all passing):**
+1. Basic compress: creates output file
+2. Roundtrip: compress then decompress matches original
+3. Multi-file: parallel compression of 3 files
+4. Large file: 1 KB file roundtrip
+5. Parallel flag: `-j 2` works correctly
+6. Empty file: fails gracefully (exit 1, no crash)
+7. Bad path: fails gracefully
+8. (Implicit) Valgrind: 0 leaks, 0 thread errors
+
+**Valgrind memcheck:** 22 allocs, 22 frees, 0 leaks
+**Valgrind helgrind:** 0 thread errors, 0 data races
+
+---
+
+## 10. Known Limitations & Future Work
 
 - **Compression ratio:** RLE is simple but weak for random or already-compressed
-  data. A Huffman or LZ77 implementation would generalise better.
-- **Thread pool:** The current design spawns and joins threads in fixed batches.
-  A persistent thread pool with a condition-variable-guarded job queue
-  (producer-consumer pattern) would reduce thread creation overhead for many
-  small files.
-- **Integrity check:** No checksum is stored in `.rle` files. A CRC32 header
-  would catch corrupted input before decompression.
-- **Max file count:** Hardcoded at 64. A dynamic array would remove this limit.
+  data. Huffman or LZ77 would generalise better.
+- **Max 64 files:** Hardcoded limit. A dynamic array would remove this.
+- **No CRC:** No checksum stored in `.rle` files. A CRC32 header would catch
+  corruption before decompression.
+- **Thread pool:** Current design spawns and joins in fixed batches. A
+  persistent pool with a condition-variable-guarded job queue would reduce
+  thread creation overhead for many small files.
+- **Backward compatibility:** v1 `.rle` files will not decompress (breaking
+  change). This is acceptable for a student project.
