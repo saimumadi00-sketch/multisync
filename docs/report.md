@@ -208,15 +208,34 @@ summary reports how many jobs succeeded vs. failed.
 
 ## 9. Testing
 
-**Unit tests (8 cases, all passing):**
-1. Basic compress: creates output file
-2. Roundtrip: compress then decompress matches original
-3. Multi-file: parallel compression of 3 files
-4. Large file: 1 KB file roundtrip
-5. Parallel flag: `-j 2` works correctly
-6. Empty file: fails gracefully (exit 1, no crash)
-7. Bad path: fails gracefully
-8. (Implicit) Valgrind: 0 leaks, 0 thread errors
+**Automated tests (14 checks, all passing):**
+1. Basic compress: command succeeds on `hello.txt`
+2. Output file exists: verifies `.rle` creation
+3. Roundtrip: compress then decompress matches original
+4. Multi-file: parallel compression of 3 files
+5. Large file: 1 KB file roundtrip
+6. Parallel flag: `-j 2` works correctly
+7. Empty file: fails gracefully (exit 1, no crash)
+8. Bad path: fails gracefully
+9. Single-byte file: smallest valid non-empty input roundtrips
+10. Long run: 700 repeated bytes roundtrip correctly
+11. Long run size: confirms split into 255-byte RLE chunks
+12. Binary pattern: NUL bytes and `0xFF` bytes roundtrip correctly
+13. Alternating data: worst-case expanding input still roundtrips
+14. Corrupt `.rle`: invalid magic/header fails cleanly
+
+**Test data coverage:**
+
+| Data Type | Purpose |
+|-----------|---------|
+| Short text | Basic CLI smoke test |
+| Repetitive text | Best-case RLE compression |
+| Long repeated run | Verifies 255-byte count limit handling |
+| Alternating text | Worst-case RLE expansion |
+| Random binary | Large binary input stress case |
+| Binary pattern | NUL and high-byte value safety |
+| Empty file | Graceful failure path |
+| Corrupt `.rle` | Header/magic validation |
 
 **Valgrind memcheck:** 22 allocs, 22 frees, 0 leaks
 **Valgrind helgrind:** 0 thread errors, 0 data races

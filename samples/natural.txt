@@ -1,0 +1,3 @@
+MultiSync is a small operating systems project written in C.
+It uses POSIX threads to process multiple files at the same time.
+This natural text sample is useful because RLE usually does not compress it well.

@@ -11,7 +11,12 @@ printf 'Hello, World!\n'                          > "$DATA/hello.txt"
 printf 'AAAAAAAAABBBBBBBBCCCCCCCC'                > "$DATA/repeat.txt"
 dd if=/dev/urandom bs=1024 count=64 2>/dev/null   > "$DATA/random.bin"
 printf ''                                          > "$DATA/empty.txt"
-python3 -c "print('A'*500 + 'B'*500, end='')"    > "$DATA/large.txt"
+printf 'Z'                                         > "$DATA/single.txt"
+printf 'NOT_A_REAL_RLE_FILE'                       > "$DATA/corrupt.rle"
+python3 -c "print('A'*500 + 'B'*500, end='')"      > "$DATA/large.txt"
+python3 -c "print('A'*700, end='')"                > "$DATA/longrun.txt"
+python3 -c "print('AB'*512, end='')"               > "$DATA/alternating.txt"
+python3 -c "from pathlib import Path; Path('$DATA/binary_pattern.bin').write_bytes(bytes([0])*300 + bytes([255])*300 + bytes(range(64))*4)"
 
 check() {
     local name="$1"; shift
@@ -77,6 +82,46 @@ if [ "$CODE" -ne 0 ]; then
     PASS=$((PASS + 1))
 else
     echo "  [FAIL] T7: expected failure on bad path"
+    FAIL=$((FAIL + 1))
+fi
+
+# T8 – single-byte file roundtrip
+$BIN "$DATA/single.txt" > /dev/null 2>&1
+$BIN -d "$DATA/single.txt.rle" > /dev/null 2>&1
+check "T8: single-byte file roundtrip matches" \
+    cmp "$DATA/single.txt" "$DATA/single.txt.out"
+
+# T9 – long run should split into multiple 255-byte RLE pairs
+$BIN "$DATA/longrun.txt" > /dev/null 2>&1
+$BIN -d "$DATA/longrun.txt.rle" > /dev/null 2>&1
+check "T9: long run roundtrip matches" \
+    cmp "$DATA/longrun.txt" "$DATA/longrun.txt.out"
+LONGRUN_RLE_SIZE=$(wc -c < "$DATA/longrun.txt.rle")
+check "T9: long run compresses to expected 18 bytes" \
+    test "$LONGRUN_RLE_SIZE" -eq 18
+
+# T10 – binary pattern data with NUL and 0xFF bytes
+$BIN "$DATA/binary_pattern.bin" > /dev/null 2>&1
+$BIN -d "$DATA/binary_pattern.bin.rle" > /dev/null 2>&1
+check "T10: binary pattern roundtrip matches" \
+    cmp "$DATA/binary_pattern.bin" "$DATA/binary_pattern.bin.out"
+
+# T11 – alternating data expands but must still roundtrip correctly
+$BIN "$DATA/alternating.txt" > /dev/null 2>&1
+$BIN -d "$DATA/alternating.txt.rle" > /dev/null 2>&1
+check "T11: alternating data roundtrip matches" \
+    cmp "$DATA/alternating.txt" "$DATA/alternating.txt.out"
+
+# T12 – corrupt .rle should fail gracefully
+set +e
+$BIN -d "$DATA/corrupt.rle" > /dev/null 2>&1
+CODE=$?
+set -e
+if [ "$CODE" -ne 0 ]; then
+    echo "  [PASS] T12: corrupt .rle handled gracefully"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T12: expected failure on corrupt .rle"
     FAIL=$((FAIL + 1))
 fi
 

@@ -22,7 +22,11 @@ multisync/
 │   ├── worker.c       # Thread worker: reads, processes, writes file
 │   └── logger.c       # Mutex-protected printf wrapper
 ├── tests/
-│   └── run_tests.sh   # Automated test suite (8 test cases)
+│   └── run_tests.sh   # Automated test suite (14 checks)
+├── samples/
+│   ├── repetitive.txt # Small manual demo inputs
+│   ├── natural.txt
+│   └── alternating.txt
 ├── docs/
 │   └── report.md      # Design report (submit alongside code)
 ├── .gitignore
@@ -39,7 +43,7 @@ multisync/
 ```bash
 make          # build → ./multisync
 make clean    # remove binaries and test output files
-make test     # build + run all 8 test cases
+make test     # build + run all 14 automated checks
 make valgrind # run under Valgrind memcheck + helgrind
 ```
 
@@ -54,6 +58,9 @@ make valgrind # run under Valgrind memcheck + helgrind
 
 # Compress multiple files in parallel
 ./multisync file1.txt file2.txt file3.bin
+
+# Try included sample data
+./multisync samples/repetitive.txt samples/natural.txt samples/alternating.txt
 
 # Limit parallelism to 2 threads at a time
 ./multisync -j 2 file1.txt file2.txt file3.txt file4.txt
@@ -75,6 +82,22 @@ make valgrind # run under Valgrind memcheck + helgrind
 | `-h`    | Print usage                                      |
 
 **Important:** All flags must come *before* file arguments.
+
+---
+
+## Sample Data
+
+The `samples/` directory contains small text files for manual demos:
+
+| File | Purpose |
+|------|---------|
+| `samples/repetitive.txt` | Shows where RLE compresses well |
+| `samples/natural.txt` | Shows normal text that may expand |
+| `samples/alternating.txt` | Shows worst-case alternating patterns |
+
+Generated stress-test data is created automatically by `make test` under
+`tests/data/`, including random binary data, long runs over 255 bytes,
+single-byte files, alternating text, and corrupt `.rle` input.
 
 ---
 
