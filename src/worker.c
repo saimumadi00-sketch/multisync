@@ -46,6 +46,9 @@ void *worker_run(void *arg)
 {
     job_t *job = (job_t *)arg;
     job->result = -1;
+    job->status = "FAIL";
+    job->in_size = 0;
+    job->out_size = 0;
 
     struct timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
@@ -57,6 +60,7 @@ void *worker_run(void *arg)
         logger_log(job->job_id, "ERROR: cannot read '%s'", job->input_path);
         goto done;
     }
+    job->in_size = (size_t)in_size;
     logger_log(job->job_id, "Read %ld bytes from '%s'", in_size, job->input_path);
 
     {   /* new scope so we can declare vars after the goto-safe label */
@@ -99,12 +103,17 @@ void *worker_run(void *arg)
         in_buf = NULL;
 
         if (out_size < 0) {
-            logger_log(job->job_id, "ERROR: %s failed on '%s'",
-                       job->mode == MODE_COMPRESS ? "compression" : "decompression",
-                       job->input_path);
+            if (job->mode == MODE_DECOMPRESS)
+                logger_log(job->job_id,
+                           "ERROR: decompression failed or CRC mismatch on '%s'",
+                           job->input_path);
+            else
+                logger_log(job->job_id, "ERROR: compression failed on '%s'",
+                           job->input_path);
             free(out_buf);
             goto done;
         }
+        job->out_size = (size_t)out_size;
 
         /* ── Write output ── */
         if (write_file(job->output_path, out_buf, (size_t)out_size) < 0) {
@@ -134,6 +143,7 @@ void *worker_run(void *arg)
         }
 
         job->result = 0;
+        job->status = "OK";
     }
 
 done:

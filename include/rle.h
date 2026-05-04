@@ -8,17 +8,18 @@
  * .rle file format:
  *   [4 bytes] magic:         0x52 0x4C 0x45 0x00  ("RLE\0")
  *   [8 bytes] original_size: uint64_t, little-endian
+ *   [4 bytes] crc32:         CRC32 of original data, little-endian
  *   [N bytes] rle_pairs:     (count, value) pairs
  *
  * Storing original_size in the header lets decompression allocate
- * exactly the right buffer instead of guessing with a multiplier.
+ * exactly the right buffer. The CRC32 detects corrupt payloads.
  */
 
 #define RLE_MAGIC_0    0x52u  /* 'R' */
 #define RLE_MAGIC_1    0x4Cu  /* 'L' */
 #define RLE_MAGIC_2    0x45u  /* 'E' */
 #define RLE_MAGIC_3    0x00u
-#define RLE_HEADER_LEN 12     /* 4 magic + 8 original_size */
+#define RLE_HEADER_LEN 16     /* 4 magic + 8 original_size + 4 crc32 */
 
 /* Compress src into dst.
  * dst must have at least RLE_HEADER_LEN + 2*len bytes.
