@@ -22,6 +22,13 @@ stdin/stdout pipeline support.
 | Benchmark mode | Runs compression five times per file and reports min/max/avg speed. |
 | Graceful SIGINT | Stops dispatching new jobs after Ctrl+C while allowing running jobs to finish. |
 
+## Demo Video
+
+<video src="docs/assets/multisync-demo.mp4" controls width="100%" title="MultiSync demo"></video>
+
+If the video preview is not shown by your Markdown viewer, open
+[docs/assets/multisync-demo.mp4](docs/assets/multisync-demo.mp4).
+
 ## Project Layout
 
 ```text
