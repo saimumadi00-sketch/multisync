@@ -1,9 +1,6 @@
 # MultiSync — Design Report
 
-**Course:** Operating Systems (300-Level)
-**Project:** Multi-Threaded File Compression Tool
-**Student:** ____________________________
-**Date:** April 2026
+Design report for a pthread-based multi-file compression tool.
 
 ---
 
@@ -253,4 +250,4 @@ summary reports how many jobs succeeded vs. failed.
   persistent pool with a condition-variable-guarded job queue would reduce
   thread creation overhead for many small files.
 - **Backward compatibility:** v1 `.rle` files will not decompress (breaking
-  change). This is acceptable for a student project.
+  change). This is acceptable for a course-sized systems project.
