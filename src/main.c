@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +8,8 @@
 #include <time.h>
 
 #include "logger.h"
+#include "progress.h"
+#include "rle.h"
 #include "threadpool.h"
 #include "worker.h"
 
@@ -40,19 +43,25 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s [options] file1 file2 ...\n\n"
+        "  %s [options] file1 file2 ...\n"
+        "  cat file | %s [options] - > file.rle\n\n"
         "Options:\n"
         "  -d          Decompress (default: compress)\n"
         "  -j <N>      Max worker threads (default: min(files, 4))\n"
         "  -o <dir>    Write all outputs into directory\n"
         "  -s          Print compression statistics after all jobs finish\n"
+        "  -a          Auto-select STORED mode for high-entropy inputs\n"
+        "  -p          Show real-time per-file progress bars\n"
+        "  -l <1|2|3>  Compression level (default: 2)\n"
+        "  --bench     Benchmark compression, five runs per file, no outputs\n"
         "  -h          Show this help\n\n"
         "Output files:\n"
         "  Compress:   file.rle\n"
-        "  Decompress: file.out  (strips .rle extension)\n\n"
+        "  Decompress: file.out  (strips .rle extension)\n"
+        "  Filename -: read stdin and write stdout\n\n"
         "Notes:\n"
         "  All options must come before file arguments.\n",
-        prog);
+        prog, prog);
 }
 
 static int parse_positive_int(const char *value, int *out)
@@ -66,6 +75,21 @@ static int parse_positive_int(const char *value, int *out)
         return -1;
     if (parsed > MAX_FILES)
         parsed = MAX_FILES;
+
+    *out = (int)parsed;
+    return 0;
+}
+
+static int parse_level(const char *value, int *out)
+{
+    char *end = NULL;
+    long parsed;
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < RLE_MIN_LEVEL || parsed > RLE_MAX_LEVEL)
+        return -1;
 
     *out = (int)parsed;
     return 0;
@@ -117,11 +141,16 @@ static const char *path_sep_for_dir(const char *dir)
 /* Build output path:
  *   compress   -> append .rle
  *   decompress -> strip .rle suffix if present, append .out
- * If output_dir is set, write the basename into that directory. */
+ * If input is "-", return "" as the stdout sentinel. */
 static int make_output_path(const char *input, op_mode_t mode,
                             const char *output_dir,
                             char *out, size_t out_len)
 {
+    if (strcmp(input, "-") == 0) {
+        out[0] = '\0';
+        return 0;
+    }
+
     const char *name = output_dir ? path_leaf(input) : input;
     size_t name_len = strlen(name);
     int needed;
@@ -208,6 +237,54 @@ static void print_stats(const job_t *jobs, int n_files)
            ratio_count > 0 ? ratio_sum / (double)ratio_count : 0.0);
 }
 
+static int print_benchmarks(job_t *jobs, int n_files)
+{
+    int fail = 0;
+
+    printf("File | Size | Min(µs) | Max(µs) | Avg(µs) | MB/s\n");
+    printf("---- | ---- | ------- | ------- | ------- | ----\n");
+
+    for (int i = 0; i < n_files; i++) {
+        if (bench_job(&jobs[i]) != 0) {
+            fprintf(stderr, "Error: benchmark failed for '%s'\n",
+                    jobs[i].input_path);
+            fail++;
+            continue;
+        }
+
+        printf("%s | %zu | %lld | %lld | %lld | %.2f\n",
+               jobs[i].input_path,
+               jobs[i].in_size,
+               jobs[i].bench_min_us,
+               jobs[i].bench_max_us,
+               jobs[i].bench_avg_us,
+               jobs[i].bench_mbps);
+    }
+
+    return fail == 0 ? 0 : 1;
+}
+
+static void init_job(job_t *job, const char *input, const char *output,
+                     op_mode_t mode, int job_id, int auto_mode, int level)
+{
+    job->input_path = input;
+    job->output_path = output;
+    job->mode = mode;
+    job->job_id = job_id;
+    job->result = -1;
+    job->elapsed_ms = 0.0;
+    job->in_size = 0;
+    job->out_size = 0;
+    job->status = "PENDING";
+    job->auto_mode = auto_mode;
+    job->level = level;
+    job->progress = NULL;
+    job->bench_min_us = 0;
+    job->bench_max_us = 0;
+    job->bench_avg_us = 0;
+    job->bench_mbps = 0.0;
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -218,10 +295,14 @@ int main(int argc, char *argv[])
     op_mode_t mode = MODE_COMPRESS;
     int max_jobs = 0;
     int stats_enabled = 0;
+    int auto_mode = 0;
+    int progress_enabled = 0;
+    int bench_enabled = 0;
+    int level = RLE_DEFAULT_LEVEL;
     const char *output_dir = NULL;
     int i = 1;
 
-    while (i < argc && argv[i][0] == '-') {
+    while (i < argc && argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
         if (strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -234,6 +315,18 @@ int main(int argc, char *argv[])
             stats_enabled = 1;
             i++;
 
+        } else if (strcmp(argv[i], "-a") == 0) {
+            auto_mode = 1;
+            i++;
+
+        } else if (strcmp(argv[i], "-p") == 0) {
+            progress_enabled = 1;
+            i++;
+
+        } else if (strcmp(argv[i], "--bench") == 0) {
+            bench_enabled = 1;
+            i++;
+
         } else if (strcmp(argv[i], "-j") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Error: -j requires a number\n");
@@ -241,6 +334,17 @@ int main(int argc, char *argv[])
             }
             if (parse_positive_int(argv[i + 1], &max_jobs) != 0) {
                 fprintf(stderr, "Error: -j must be >= 1\n");
+                return 1;
+            }
+            i += 2;
+
+        } else if (strcmp(argv[i], "-l") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: -l requires 1, 2, or 3\n");
+                return 1;
+            }
+            if (parse_level(argv[i + 1], &level) != 0) {
+                fprintf(stderr, "Error: -l must be 1, 2, or 3\n");
                 return 1;
             }
             i += 2;
@@ -272,13 +376,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Error: max %d files at once\n", MAX_FILES);
         return 1;
     }
-    if (max_jobs == 0)
-        max_jobs = (n_files < 4) ? n_files : 4;
-    if (max_jobs > n_files)
-        max_jobs = n_files;
 
+    int pipe_jobs = 0;
     for (int j = file_start; j < argc; j++) {
-        if (argv[j][0] == '-') {
+        if (strcmp(argv[j], "-") == 0) {
+            pipe_jobs++;
+        } else if (argv[j][0] == '-') {
             fprintf(stderr,
                 "Warning: '%s' looks like a flag but comes after files.\n"
                 "         All options must come before file arguments.\n",
@@ -286,32 +389,82 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (ensure_output_dir(output_dir) != 0)
+    int pipe_mode = pipe_jobs > 0;
+    if (pipe_jobs > 1 || (pipe_mode && n_files != 1)) {
+        fprintf(stderr, "Error: stdin/stdout mode allows exactly one '-' job\n");
+        return 1;
+    }
+    if (pipe_mode && (output_dir || stats_enabled || progress_enabled ||
+                      bench_enabled)) {
+        fprintf(stderr,
+                "Error: '-' cannot be combined with -o, -s, -p, or --bench\n");
+        return 1;
+    }
+    if (bench_enabled && mode == MODE_DECOMPRESS) {
+        fprintf(stderr, "Error: --bench only supports compression mode\n");
+        return 1;
+    }
+    if (bench_enabled && progress_enabled) {
+        fprintf(stderr, "Error: --bench cannot be combined with -p\n");
+        return 1;
+    }
+
+    if (max_jobs == 0)
+        max_jobs = (n_files < 4) ? n_files : 4;
+    if (max_jobs > n_files)
+        max_jobs = n_files;
+
+    if (!pipe_mode && ensure_output_dir(output_dir) != 0)
         return 1;
 
     job_t jobs[MAX_FILES];
     char out_paths[MAX_FILES][OUTPUT_PATH_MAX];
 
     for (int j = 0; j < n_files; j++) {
-        jobs[j].input_path = argv[file_start + j];
-        jobs[j].mode = mode;
-        jobs[j].job_id = j;
-        jobs[j].result = -1;
-        jobs[j].elapsed_ms = 0.0;
-        jobs[j].in_size = 0;
-        jobs[j].out_size = 0;
-        jobs[j].status = "PENDING";
-
-        if (make_output_path(jobs[j].input_path, mode, output_dir,
+        if (make_output_path(argv[file_start + j], mode, output_dir,
                              out_paths[j], sizeof(out_paths[j])) != 0)
             return 1;
-        jobs[j].output_path = out_paths[j];
+        init_job(&jobs[j], argv[file_start + j], out_paths[j],
+                 mode, j, auto_mode, level);
+    }
+
+    if (bench_enabled)
+        return print_benchmarks(jobs, n_files);
+
+    if (pipe_mode) {
+        logger_init();
+        logger_set_silent(1);
+        worker_run(&jobs[0]);
+        logger_destroy();
+        return jobs[0].result == 0 ? 0 : 1;
     }
 
     if (install_sigint_handler() != 0)
         return 1;
 
     logger_init();
+
+    progress_t progress;
+    pthread_t progress_thread;
+    int progress_started = 0;
+
+    if (progress_enabled) {
+        if (progress_init(&progress, n_files) != 0) {
+            fprintf(stderr, "Error: could not initialize progress monitor\n");
+            logger_destroy();
+            return 1;
+        }
+        for (int j = 0; j < n_files; j++)
+            jobs[j].progress = &progress;
+        if (pthread_create(&progress_thread, NULL,
+                           progress_monitor_run, &progress) != 0) {
+            fprintf(stderr, "Error: could not start progress monitor\n");
+            progress_destroy(&progress);
+            logger_destroy();
+            return 1;
+        }
+        progress_started = 1;
+    }
 
     struct timespec wall_start, wall_end;
     clock_gettime(CLOCK_MONOTONIC, &wall_start);
@@ -325,6 +478,11 @@ int main(int argc, char *argv[])
     threadpool_t pool;
     if (threadpool_init(&pool, max_jobs, max_jobs) != 0) {
         fprintf(stderr, "Error: could not start thread pool\n");
+        if (progress_started) {
+            progress_request_stop(&progress);
+            pthread_join(progress_thread, NULL);
+            progress_destroy(&progress);
+        }
         logger_destroy();
         return 1;
     }
@@ -358,6 +516,12 @@ int main(int argc, char *argv[])
     }
 
     threadpool_shutdown(&pool);
+
+    if (progress_started) {
+        progress_request_stop(&progress);
+        pthread_join(progress_thread, NULL);
+        progress_destroy(&progress);
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &wall_end);
     double wall_ms = (wall_end.tv_sec - wall_start.tv_sec) * 1000.0

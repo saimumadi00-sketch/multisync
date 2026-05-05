@@ -17,6 +17,8 @@ printf 'pool-alpha-data'                           > "$DATA/pool_a.txt"
 printf 'pool-beta-data'                            > "$DATA/pool_b.txt"
 printf 'pool-gamma-data'                           > "$DATA/pool_c.txt"
 printf 'output-directory-data'                     > "$DATA/outsrc.txt"
+printf 'pipe-mode-AAAAABBBBBCCCCCDDDDD'            > "$DATA/pipe_roundtrip.bin"
+printf 'benchmark-AAAAABBBBBCCCCCDDDDD'            > "$DATA/bench.txt"
 python3 -c "print('A'*500 + 'B'*500, end='')"      > "$DATA/large.txt"
 python3 -c "print('A'*700, end='')"                > "$DATA/longrun.txt"
 python3 -c "print('AB'*512, end='')"               > "$DATA/alternating.txt"
@@ -101,8 +103,8 @@ $BIN -d "$DATA/longrun.txt.rle" > /dev/null 2>&1
 check "T9: long run roundtrip matches" \
     cmp "$DATA/longrun.txt" "$DATA/longrun.txt.out"
 LONGRUN_RLE_SIZE=$(wc -c < "$DATA/longrun.txt.rle")
-check "T9: long run compresses to expected 22 bytes" \
-    test "$LONGRUN_RLE_SIZE" -eq 22
+check "T9: long run compresses to expected 23 bytes" \
+    test "$LONGRUN_RLE_SIZE" -eq 23
 
 # T10 – binary pattern data with NUL and 0xFF bytes
 $BIN "$DATA/binary_pattern.bin" > /dev/null 2>&1
@@ -242,6 +244,117 @@ if [ "$CODE" -ne 0 ] && grep -q "not a directory" "$DATA/not_a_dir.log"; then
     PASS=$((PASS + 1))
 else
     echo "  [FAIL] T22: expected -o non-directory failure"
+    FAIL=$((FAIL + 1))
+fi
+
+# T23 – -a stores high-entropy data instead of expanding it with RLE
+$BIN -a "$DATA/random.bin" > "$DATA/auto_stored.log" 2>&1
+RANDOM_SIZE=$(wc -c < "$DATA/random.bin")
+AUTO_STORED_SIZE=$(wc -c < "$DATA/random.bin.rle")
+if [ "$AUTO_STORED_SIZE" -eq $((RANDOM_SIZE + 17)) ] &&
+   grep -q "Selected mode: STORED" "$DATA/auto_stored.log"; then
+    echo "  [PASS] T23: -a selects STORED for high entropy data"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T23: expected STORED mode for high entropy data"
+    FAIL=$((FAIL + 1))
+fi
+
+# T24 – -a still uses RLE for low-entropy data and roundtrips
+$BIN -a "$DATA/repeat.txt" > "$DATA/auto_rle.log" 2>&1
+$BIN -d "$DATA/repeat.txt.rle" > /dev/null 2>&1
+if grep -q "Selected mode: RLE" "$DATA/auto_rle.log" &&
+   cmp "$DATA/repeat.txt" "$DATA/repeat.txt.out" > /dev/null 2>&1; then
+    echo "  [PASS] T24: -a selects RLE for low entropy data"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T24: expected RLE mode for low entropy data"
+    FAIL=$((FAIL + 1))
+fi
+
+# T25 – -p emits progress lines for an active job
+$BIN -p -j 1 "$DATA/signal_big_1.bin" > "$DATA/progress.log" 2>&1
+if grep -q "\[job-00\]" "$DATA/progress.log"; then
+    echo "  [PASS] T25: -p prints progress bar output"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T25: expected progress bar output"
+    FAIL=$((FAIL + 1))
+fi
+
+# T26 – -p is rejected for stdin/stdout mode so binary stdout stays clean
+set +e
+printf 'progress-pipe' | $BIN -p - > "$DATA/pipe_progress.out" 2> "$DATA/pipe_progress.log"
+CODE=$?
+set -e
+if [ "$CODE" -ne 0 ] && grep -q "cannot be combined" "$DATA/pipe_progress.log"; then
+    echo "  [PASS] T26: -p rejected with pipe mode"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T26: expected -p pipe-mode rejection"
+    FAIL=$((FAIL + 1))
+fi
+
+# T27 – stdin/stdout mode compresses and decompresses without log noise
+$BIN - < "$DATA/pipe_roundtrip.bin" > "$DATA/pipe_roundtrip.rle"
+$BIN -d - < "$DATA/pipe_roundtrip.rle" > "$DATA/pipe_roundtrip.out"
+check "T27: pipe mode roundtrip matches" \
+    cmp "$DATA/pipe_roundtrip.bin" "$DATA/pipe_roundtrip.out"
+
+# T28 – multiple '-' jobs are rejected
+set +e
+$BIN - - > "$DATA/multiple_dash.log" 2>&1
+CODE=$?
+set -e
+if [ "$CODE" -ne 0 ] && grep -q "exactly one '-' job" "$DATA/multiple_dash.log"; then
+    echo "  [PASS] T28: multiple '-' jobs rejected"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T28: expected multiple '-' rejection"
+    FAIL=$((FAIL + 1))
+fi
+
+# T29 – level 3 delta preprocessing roundtrips without passing -l to decompress
+$BIN -l 3 "$DATA/alternating.txt" > /dev/null 2>&1
+$BIN -d "$DATA/alternating.txt.rle" > /dev/null 2>&1
+check "T29: level 3 roundtrip matches" \
+    cmp "$DATA/alternating.txt" "$DATA/alternating.txt.out"
+
+# T30 – invalid compression levels fail cleanly
+set +e
+$BIN -l 4 "$DATA/hello.txt" > "$DATA/bad_level.log" 2>&1
+CODE=$?
+set -e
+if [ "$CODE" -ne 0 ] && grep -q -- "-l must be 1, 2, or 3" "$DATA/bad_level.log"; then
+    echo "  [PASS] T30: invalid -l rejected"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T30: expected invalid -l rejection"
+    FAIL=$((FAIL + 1))
+fi
+
+# T31 – --bench prints benchmark table and writes no output archive
+rm -f "$DATA/bench.txt.rle"
+$BIN --bench "$DATA/bench.txt" > "$DATA/bench.log" 2>&1
+if grep -q "File | Size | Min(µs) | Max(µs) | Avg(µs) | MB/s" "$DATA/bench.log" &&
+   [ ! -f "$DATA/bench.txt.rle" ]; then
+    echo "  [PASS] T31: --bench reports timings without output files"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T31: expected benchmark table with no output file"
+    FAIL=$((FAIL + 1))
+fi
+
+# T32 – --bench rejects decompression mode
+set +e
+$BIN --bench -d "$DATA/repeat.txt.rle" > "$DATA/bench_decompress.log" 2>&1
+CODE=$?
+set -e
+if [ "$CODE" -ne 0 ] && grep -q "only supports compression" "$DATA/bench_decompress.log"; then
+    echo "  [PASS] T32: --bench rejects decompression"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] T32: expected --bench decompression rejection"
     FAIL=$((FAIL + 1))
 fi
 

@@ -5,17 +5,26 @@
 #include <time.h>
 
 static pthread_mutex_t log_mutex;
+static int log_silent;
 
 void logger_init(void) {
     pthread_mutex_init(&log_mutex, NULL);
+    log_silent = 0;
 }
 
 void logger_destroy(void) {
     pthread_mutex_destroy(&log_mutex);
 }
 
+void logger_set_silent(int silent) {
+    log_silent = silent;
+}
+
 void logger_log(int job_id, const char *fmt, ...)
 {
+    if (log_silent)
+        return;
+
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     /* Show elapsed ms since program epoch (mod 100000 keeps it short) */

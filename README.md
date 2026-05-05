@@ -2,11 +2,11 @@
 
 > Operating Systems Project - 300-Level | Spring 2026
 
-MultiSync compresses and decompresses files concurrently using POSIX threads
-and Run-Length Encoding (RLE). Version 3 replaces the earlier one-thread-per-
-file batching model with a bounded thread pool, adds CRC32 integrity checking,
-supports output directories, handles SIGINT gracefully, and can print per-file
-compression statistics.
+MultiSync compresses and decompresses files using POSIX threads and
+Run-Length Encoding (RLE). The current version uses a bounded thread pool,
+CRC32 integrity checks, adaptive stored mode, optional progress bars,
+stdin/stdout streaming, compression levels, benchmark mode, output directories,
+statistics reporting, and graceful SIGINT shutdown.
 
 ---
 
@@ -16,17 +16,19 @@ compression statistics.
 multisync/
 ├── include/
 │   ├── logger.h       # Thread-safe logger API
-│   ├── rle.h          # RLE compression API and header constants
+│   ├── progress.h     # Shared progress slots and monitor API
+│   ├── rle.h          # RLE API and unified 17-byte header constants
 │   ├── threadpool.h   # Bounded work queue and worker pool API
-│   └── worker.h       # Job descriptor and worker entry point
+│   └── worker.h       # Job descriptor, worker entry point, benchmark API
 ├── src/
 │   ├── logger.c       # Mutex-protected printf wrapper
-│   ├── main.c         # CLI, argument parsing, dispatch, summary reporting
-│   ├── rle.c          # RLE codec plus CRC32 implementation
+│   ├── main.c         # CLI, dispatch, progress, stats, benchmark reporting
+│   ├── progress.c     # Progress monitor thread and bar rendering
+│   ├── rle.c          # RLE codec, CRC32, entropy, levels, stored mode
 │   ├── threadpool.c   # pthread pool with mutex/condition-variable queue
-│   └── worker.c       # Reads, processes, writes, and records job stats
+│   └── worker.c       # Reads, processes, writes, progress, benchmark runs
 ├── tests/
-│   └── run_tests.sh   # Automated test suite (T1-T22, 26 checks)
+│   └── run_tests.sh   # Automated test suite (T1-T32, 36 checks)
 ├── samples/
 │   ├── repetitive.txt
 │   ├── natural.txt
@@ -42,7 +44,7 @@ multisync/
 
 ## Build
 
-**Requirements:** GCC (C11), GNU Make, Linux, pthreads
+**Requirements:** GCC (C11), GNU Make, Linux, pthreads, libm
 
 ```bash
 make          # build ./multisync
@@ -57,6 +59,12 @@ The project is compiled with:
 gcc -std=c11 -Wall -Wextra -Wpedantic -g -Iinclude -D_POSIX_C_SOURCE=200809L
 ```
 
+The final link includes:
+
+```bash
+-lpthread -lm
+```
+
 ---
 
 ## Usage
@@ -64,26 +72,37 @@ gcc -std=c11 -Wall -Wextra -Wpedantic -g -Iinclude -D_POSIX_C_SOURCE=200809L
 ```bash
 # Compress one file
 ./multisync file.txt
-# produces file.txt.rle
 
-# Compress multiple files using the default pool size min(files, 4)
+# Compress multiple files with the default pool size min(files, 4)
 ./multisync file1.txt file2.txt file3.bin
 
 # Limit the worker pool to 2 threads
 ./multisync -j 2 file1.txt file2.txt file3.txt file4.txt
 
+# Adaptive mode: store high-entropy inputs instead of expanding them
+./multisync -a random.bin
+
+# Maximum compression level with delta preprocessing
+./multisync -l 3 samples/alternating.txt
+
+# Show progress bars
+./multisync -p -j 2 big1.bin big2.bin
+
 # Write all outputs to a directory
 ./multisync -o compressed file1.txt file2.txt
 
-# Decompress
+# Decompress; level is read from the header
 ./multisync -d file.txt.rle
-# produces file.txt.out
 
-# Decompress into a directory and print stats
-./multisync -d -s -o restored file.txt.rle
+# Pipe mode
+cat file.txt | ./multisync - > file.txt.rle
+cat file.txt.rle | ./multisync -d - > file.txt.out
 
-# Show help
-./multisync -h
+# Benchmark compression without writing output archives
+./multisync --bench file1.txt file2.bin
+
+# Print stats after normal jobs finish
+./multisync -s file1.txt file2.txt
 ```
 
 ### Flags
@@ -92,11 +111,19 @@ gcc -std=c11 -Wall -Wextra -Wpedantic -g -Iinclude -D_POSIX_C_SOURCE=200809L
 |------|-------------|
 | `-d` | Decompress mode. Default is compression. |
 | `-j N` | Worker pool size limit. Default is `min(number_of_files, 4)`. |
-| `-o DIR` | Write every output file into `DIR`. The directory is created with `mkdir()` and `S_IRWXU` if missing. |
+| `-o DIR` | Write every output file into `DIR`; creates the directory with `mkdir()` and `S_IRWXU` if missing. |
 | `-s` | Print a statistics table after all jobs complete. |
+| `-a` | Auto mode. Samples the first 4096 bytes and stores high-entropy input raw when entropy is greater than 7.2. |
+| `-p` | Print real-time progress bars from a dedicated monitor thread. |
+| `-l 1` | Fast standard RLE. |
+| `-l 2` | Default RLE behavior with logical long-run handling across 255-byte pair boundaries. |
+| `-l 3` | Level 2 plus delta encoding preprocessing; decompression reverses it automatically from the stored level. |
+| `--bench` | Run five compression trials per file, print timing/throughput, and write no output archives. |
 | `-h` | Print usage. |
 
-All flags must come before file arguments.
+All flags must come before file arguments. Pipe mode with `-` is intentionally
+single-job only and cannot be combined with `-o`, `-s`, `-p`, or `--bench`,
+because stdout must remain clean binary data.
 
 ---
 
@@ -117,8 +144,75 @@ With `-o DIR`, outputs are written inside `DIR` using the input basename:
 | Compress | `data/file.txt` | `DIR/file.txt.rle` |
 | Decompress | `data/file.txt.rle` | `DIR/file.txt.out` |
 
-If the `-o` path exists but is not a directory, MultiSync exits with a clear
-error. Parent directories are not created recursively.
+With input `-`, MultiSync reads stdin and writes stdout. Logger and normal
+summary output are suppressed in that mode to avoid corrupting binary output.
+
+---
+
+## RLE Format
+
+### Unified 17-byte header
+
+Every archive now starts with the same 17-byte header:
+
+```text
+Byte(s)   Field                Description
+0..3      magic                0x52 0x4C 0x45 0x00 ("RLE\0")
+4..11     original_size        uint64_t, little-endian
+12..15    crc32                CRC32 of original uncompressed data
+16        compression_flags    bit 0: 1 = STORED, 0 = RLE_COMPRESSED
+                               bits 1-2: compression level 1..3
+17..N     payload              raw bytes for STORED, RLE pairs otherwise
+```
+
+`RLE_MODE_STORED` means the payload is the original bytes. This is selected by
+`-a` when Shannon entropy over the first 4096 bytes is greater than 7.2.
+
+`RLE_MODE_RLE` means the payload is `(count, value)` pairs:
+
+```text
+[count (1 byte)] [value (1 byte)]
+```
+
+The CRC32 uses the standard reflected polynomial `0xEDB88320`. Decompression
+validates magic, size, compression flags, decoded length, and CRC. The level is
+always read from byte 16, so users do not pass `-l` when decompressing.
+
+### Compatibility Note
+
+This is a breaking format change from the previous 16-byte header. Older `.rle`
+files without the compression-flags byte will fail decompression. Re-compress
+source files with this version to produce compatible archives.
+
+---
+
+## Adaptive Mode
+
+`-a` estimates entropy using:
+
+```text
+H = -sum(p_i * log2(p_i))
+```
+
+for all byte values 0-255 over the first 4096 bytes, or the whole file if it is
+smaller. If `H > 7.2`, MultiSync writes a STORED archive instead of RLE. This
+keeps random or already-compressed data from expanding to roughly twice its
+original size.
+
+---
+
+## Progress Bars
+
+`-p` creates one monitor thread in `main.c`, separate from the worker pool.
+Workers update shared `progress_t` slots with processed byte counts. The monitor
+wakes every 100 ms with `nanosleep()`, reads slots under a `pthread_rwlock_t`,
+and redraws active jobs on stderr:
+
+```text
+[job-00] ████████░░░░░░░░ 52% (51200/98304 bytes)
+```
+
+Progress output is disabled for pipe mode.
 
 ---
 
@@ -134,29 +228,40 @@ total bytes saved | 984
 average ratio | 3.91%
 ```
 
-For compression, `Original` is the input size and `Compressed` is the `.rle`
-output size. For decompression, the same columns are reported in logical file
-format terms: `Original` is the restored output size and `Compressed` is the
-compressed input size. Failed and cancelled jobs remain in the table with
-`FAIL` or `CANCELLED` status.
+For compression, `Original` is the input size and `Compressed` is the archive
+size. For decompression, `Original` is the restored output size and
+`Compressed` is the compressed input size. Failed and cancelled jobs remain in
+the table.
+
+---
+
+## Benchmark Mode
+
+`--bench` runs each input through compression five times in the current process,
+single-threaded per file, and writes no `.rle` output. It reports:
+
+```text
+File | Size | Min(µs) | Max(µs) | Avg(µs) | MB/s
+```
+
+This mode is for profiling the RLE algorithm and does not affect normal
+compress/decompress behavior.
 
 ---
 
 ## Thread Pool Design
 
-Version 3 uses a fixed-size pool instead of creating and joining one pthread
-per file batch. `main.c` creates a `threadpool_t`, then submits `job_t` pointers
-into a bounded FIFO queue. The queue is protected by one mutex and two condition
-variables:
+Normal file jobs use a fixed-size pool. `main.c` submits `job_t` pointers into
+a bounded FIFO queue protected by one mutex and two condition variables:
 
 | Condition variable | Purpose |
 |--------------------|---------|
 | `not_empty` | Worker threads sleep here until a job is available. |
 | `not_full` | The main dispatch loop sleeps here when the bounded queue is full. |
 
-Each pool thread repeatedly dequeues one job and calls `worker_run(job)`.
-`threadpool_shutdown()` marks the pool as closing, wakes sleepers, drains any
-already queued jobs, joins all pool threads, and destroys the synchronization
+Each pool thread dequeues one job and calls `worker_run(job)`.
+`threadpool_shutdown()` marks the pool as closing, wakes sleepers, drains
+already queued jobs, joins all pool threads, and destroys synchronization
 objects.
 
 ---
@@ -164,10 +269,9 @@ objects.
 ## Signal Handling
 
 MultiSync installs a `SIGINT` handler with `sigaction()`. The handler only sets
-a `volatile sig_atomic_t` flag, which is safe inside a signal handler. The main
-dispatch loop and timed queue submit path check that flag and stop submitting
-new jobs after Ctrl+C. Jobs that are already running or already queued are
-allowed to finish.
+a `volatile sig_atomic_t` flag. The dispatch loop and timed queue submit path
+check that flag and stop submitting new jobs after Ctrl+C. Running and already
+queued jobs finish.
 
 On interruption, MultiSync prints:
 
@@ -176,41 +280,6 @@ Interrupted — N jobs cancelled
 ```
 
 and exits non-zero.
-
----
-
-## RLE Format
-
-### Version 3 wire format
-
-Every `.rle` file starts with a 16-byte header:
-
-```text
-[4 bytes] Magic:         0x52 0x4C 0x45 0x00  ("RLE\0")
-[8 bytes] Original size: uint64_t, little-endian
-[4 bytes] CRC32:         CRC32 of original uncompressed data, little-endian
-[N bytes] RLE pairs:     (count, value) pairs
-```
-
-Payload encoding is unchanged:
-
-```text
-[count (1 byte)] [value (1 byte)]
-```
-
-Example payload: `AAABBC` becomes `03 41 02 42 01 43`, plus the 16-byte header.
-
-During decompression, MultiSync validates the magic bytes, decodes exactly the
-stored original size, recomputes CRC32 over the decompressed output, and fails
-the job if the checksum does not match. CRC32 uses the standard reflected
-polynomial `0xEDB88320`.
-
-### Breaking compatibility note
-
-Version 3 is a breaking format change. Old version 2 `.rle` files used a
-12-byte header without CRC32. They will fail decompression under v3 because the
-decoder expects a 16-byte header and verifies the CRC. Re-compress source files
-with this version to produce compatible archives.
 
 ---
 
@@ -227,17 +296,18 @@ The `samples/` directory contains small text files for manual demos:
 Generated stress-test data is created automatically by `make test` under
 `tests/data/`, including random binary data, long runs over 255 bytes,
 single-byte files, alternating text, CRC-corrupted archives, SIGINT fixtures,
-and invalid output-directory cases.
+pipe-mode fixtures, progress logs, and benchmark checks.
 
 ---
 
 ## Known Limitations
 
-- RLE is ineffective on random or already-compressed data and may expand it.
+- RLE is still simple and may not beat general-purpose compressors.
 - Max 64 input files per invocation.
 - `-o` creates only the final directory, not missing parent directories.
 - Empty input files currently fail gracefully instead of producing an empty
   archive.
+- Pipe mode supports exactly one `-` job per invocation.
 
 ---
 
@@ -247,10 +317,13 @@ and invalid output-directory cases.
 |---------|-------|
 | Thread pool | `pthread_create` / `pthread_join` in `src/threadpool.c` |
 | Bounded producer-consumer queue | `pthread_mutex_t`, `not_full`, `not_empty` in `src/threadpool.c` |
+| Reader-writer synchronization | `pthread_rwlock_t` in `src/progress.c` |
 | Mutex synchronization | Logger mutex in `src/logger.c` |
 | Signal handling | `sigaction()` and `volatile sig_atomic_t` in `src/main.c` |
+| Pipe I/O | stdin/stdout handling in `src/worker.c` |
 | File I/O | `fopen`, `fread`, `fwrite`, `fclose` in `src/worker.c` |
-| Dynamic memory | Per-file buffers and thread-pool arrays |
+| Dynamic memory | File buffers, stdin growth buffer, pool arrays, progress slots |
 | Wall-clock timing | `clock_gettime(CLOCK_MONOTONIC)` |
+| Entropy math | Shannon entropy with `log2()` in `src/rle.c` |
 | Integrity checking | CRC32 in `src/rle.c` |
 | Error handling | Checked system/library calls with graceful job failure |
